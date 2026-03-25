@@ -1,0 +1,37 @@
+[package]
+name = "lunar-lander-quic-client"
+version = "0.1.0"
+description = "Official Rust QUIC client for Hello Moon Lunar Lander"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/hellomoon-io/lunar-lander-quic-client-rs"
+homepage = "https://docs.hellomoon.io/reference/lunar-lander"
+keywords = ["solana", "quic", "lunar-lander", "hellomoon"]
+categories = ["network-programming", "api-bindings"]
+include = [
+    "src/**",
+    "examples/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+]
+
+[dependencies]
+quinn = "0.11.6"
+rcgen = "0.13"
+rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs"] }
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["time", "io-util"] }
+
+[dev-dependencies]
+anyhow = "1.0.100"
+bincode = "1.3.3"
+rand = "0.8.5"
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1.0.145"
+solana-compute-budget-interface = "3.0.0"
+solana-sdk = "3.0.0"
+solana-system-interface = { version = "3.1.0", features = ["bincode"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,81 @@
+# lunar-lander-quic-client
+
+[![CI](https://github.com/hellomoon-io/lunar-lander-quic-client-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hellomoon-io/lunar-lander-quic-client-rs/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](./LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](./Cargo.toml)
+
+Official Rust QUIC client for Hello Moon Lunar Lander.
+
+This crate is intentionally focused on a small surface area:
+- connect to a Lunar Lander QUIC endpoint
+- authenticate with a client certificate derived from your API key
+- send one serialized Solana transaction per uni stream
+
+## What it supports
+
+- Lunar Lander QUIC submission
+- in-code self-signed client certificate generation
+- one connection reused across many sends
+
+## What it does not do
+
+- build or sign transactions for you
+- simulate or preflight transactions
+- provide JSON-RPC wrappers
+- submit HTTP batches or bundles
+
+## Install
+
+```toml
+[dependencies]
+lunar-lander-quic-client = "0.1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+## Quick start
+
+```rust
+use lunar_lander_quic_client::LunarLanderQuicClient;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let api_key = std::env::var("LUNAR_LANDER_API_KEY")?;
+    let client = LunarLanderQuicClient::connect(
+        "fra.lunar-lander.hellomoon.io:16888",
+        api_key,
+    )
+    .await?;
+
+    let tx_bytes = create_signed_transaction_somewhere()?;
+    client.send_transaction(&tx_bytes).await?;
+
+    Ok(())
+}
+```
+
+## Examples
+
+This repo includes:
+- `send_transaction`: fetch a recent blockhash, build a tipped transaction, sign it, and send it over QUIC
+
+Run the richer example with:
+
+```bash
+LUNAR_LANDER_API_KEY=your-api-key \
+LUNAR_LANDER_QUIC_ENDPOINT=fra.lunar-lander.hellomoon.io:16888 \
+KEYPAIR_PATH=~/.config/solana/id.json \
+RPC_URL=https://api.mainnet-beta.solana.com \
+cargo run --example send_transaction
+```
+
+The richer example:
+- uses the Lunar Lander tip destination list
+- randomly selects one destination on each run
+- sends minimum tip threshold of `1_000_000` lamports
+
+## Notes
+
+- Lunar Lander QUIC is tip-enforced.
+- The client sends raw transaction bytes only.
+- The client generates the client certificate in code from your API key.
+- Lunar Lander QUIC is fire-and-forget and does not return a per-stream response body.
