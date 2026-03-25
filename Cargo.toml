@@ -7,6 +7,7 @@ rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/hellomoon-io/lunar-lander-quic-client-rs"
 homepage = "https://docs.hellomoon.io/reference/lunar-lander"
+documentation = "https://docs.rs/lunar-lander-quic-client"
 keywords = ["solana", "quic", "lunar-lander", "hellomoon"]
 categories = ["network-programming", "api-bindings"]
 include = [

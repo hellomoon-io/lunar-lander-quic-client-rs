@@ -1,6 +1,8 @@
 # lunar-lander-quic-client
 
 [![CI](https://github.com/hellomoon-io/lunar-lander-quic-client-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hellomoon-io/lunar-lander-quic-client-rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/lunar-lander-quic-client.svg)](https://crates.io/crates/lunar-lander-quic-client)
+[![docs.rs](https://img.shields.io/docsrs/lunar-lander-quic-client)](https://docs.rs/lunar-lander-quic-client)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](./Cargo.toml)
 
