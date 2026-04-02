@@ -49,13 +49,35 @@
 //!     unimplemented!("build and serialize a signed Solana transaction")
 //! }
 //! ```
+//!
+//! # MEV Protection
+//!
+//! Enable MEV protection by setting `mev_protect: true` in [`ClientOptions`]:
+//!
+//! ```no_run
+//! use lunar_lander_quic_client::{ClientOptions, LunarLanderQuicClient};
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let client = LunarLanderQuicClient::connect_with_options(
+//!     "fra.lunar-lander.hellomoon.io:16888",
+//!     std::env::var("LUNAR_LANDER_API_KEY")?,
+//!     ClientOptions {
+//!         mev_protect: true,
+//!         ..ClientOptions::default()
+//!     },
+//! )
+//! .await?;
+//! # Ok(())
+//! # }
+//! ```
 
 use {
     quinn::{
         ClientConfig as QuinnClientConfig, ConnectError, Connection, ConnectionError, Endpoint,
         IdleTimeout, TransportConfig, WriteError, crypto::rustls::QuicClientConfig,
     },
-    rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair},
+    rcgen::{CertificateParams, CustomExtension, DistinguishedName, DnType, KeyPair},
     rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     rustls::{
         DigitallySignedStruct, SignatureScheme,
@@ -73,6 +95,12 @@ use {
 
 /// ALPN identifier used by the Lunar Lander QUIC endpoint.
 pub const LUNAR_LANDER_TPU_PROTOCOL_ID: &[u8] = b"lunar-lander-tpu";
+
+/// ITU-T experimental OID arc (2.999) for Lunar Lander QUIC extensions.
+///
+/// - `2.999.1` — Lunar Lander QUIC feature extensions
+/// - `2.999.1.1` — MEV Protect
+const OID_MEV_PROTECT: &[u64] = &[2, 999, 1, 1];
 /// Default UDP port for Lunar Lander QUIC ingress.
 pub const DEFAULT_PORT: u16 = 16_888;
 /// Maximum serialized Solana transaction size accepted on the QUIC path.
@@ -87,6 +115,12 @@ pub struct ClientOptions {
     pub keepalive_interval: Duration,
     /// Idle timeout advertised to Quinn for this client connection.
     pub idle_timeout: Duration,
+    /// When `true`, embeds a custom X.509 certificate extension that signals
+    /// the server to enable MEV protection for transactions sent over this
+    /// connection. The extension uses the ITU-T experimental OID arc
+    /// `2.999.1.1` and is marked non-critical so older servers that do not
+    /// understand it will simply ignore it.
+    pub mev_protect: bool,
 }
 
 impl Default for ClientOptions {
@@ -95,6 +129,7 @@ impl Default for ClientOptions {
             connect_timeout: Duration::from_secs(5),
             keepalive_interval: Duration::from_secs(25),
             idle_timeout: Duration::from_secs(30),
+            mev_protect: false,
         }
     }
 }
@@ -271,6 +306,13 @@ fn build_client_config(api_key: &str, options: &ClientOptions) -> Result<QuinnCl
     let mut distinguished_name = DistinguishedName::new();
     distinguished_name.push(DnType::CommonName, api_key);
     params.distinguished_name = distinguished_name;
+
+    if options.mev_protect {
+        // DER-encoded BOOLEAN TRUE (tag 0x01, length 0x01, value 0xFF).
+        let ext = CustomExtension::from_oid_content(OID_MEV_PROTECT, vec![0x01, 0x01, 0xFF]);
+        params.custom_extensions.push(ext);
+    }
+
     let certificate = params
         .self_signed(&key_pair)
         .map_err(|error| ClientError::ClientCertificate(error.to_string()))?;
@@ -415,5 +457,30 @@ mod tests {
     #[test]
     fn parses_host_from_ipv6_endpoint() {
         assert_eq!(host_from_endpoint("[::1]:16888").unwrap(), "::1");
+    }
+
+    #[test]
+    fn default_options_have_mev_protect_disabled() {
+        let options = ClientOptions::default();
+        assert!(!options.mev_protect);
+    }
+
+    #[test]
+    fn build_client_config_without_mev_protect() {
+        install_rustls_provider();
+        let options = ClientOptions::default();
+        // Should succeed and produce a valid QUIC client config.
+        build_client_config("test-api-key", &options).unwrap();
+    }
+
+    #[test]
+    fn build_client_config_with_mev_protect() {
+        install_rustls_provider();
+        let options = ClientOptions {
+            mev_protect: true,
+            ..ClientOptions::default()
+        };
+        // Should succeed — the custom extension must not break cert generation.
+        build_client_config("test-api-key", &options).unwrap();
     }
 }

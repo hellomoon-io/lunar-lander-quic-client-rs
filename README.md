@@ -55,6 +55,39 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+## MEV Protection
+
+Set `mev_protect: true` in `ClientOptions` to signal the server to enable MEV
+protection for transactions sent over this connection. The flag embeds a custom
+X.509 certificate extension (OID `2.999.1.1`) in the self-signed
+client certificate. The extension is non-critical, so older servers that do not
+understand it will simply ignore it.
+
+```rust
+use lunar_lander_quic_client::{ClientOptions, LunarLanderQuicClient};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let api_key = std::env::var("LUNAR_LANDER_API_KEY")?;
+    let options = ClientOptions {
+        mev_protect: true,
+        ..ClientOptions::default()
+    };
+
+    let client = LunarLanderQuicClient::connect_with_options(
+        "fra.lunar-lander.hellomoon.io:16888",
+        api_key,
+        options,
+    )
+    .await?;
+
+    let tx_bytes = create_signed_transaction_somewhere()?;
+    client.send_transaction(&tx_bytes).await?;
+
+    Ok(())
+}
+```
+
 ## Examples
 
 This repo includes:

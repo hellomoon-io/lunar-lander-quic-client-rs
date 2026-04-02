@@ -1,6 +1,6 @@
 use {
     anyhow::{Context, Result, bail},
-    lunar_lander_quic_client::LunarLanderQuicClient,
+    lunar_lander_quic_client::{ClientOptions, LunarLanderQuicClient},
     rand::seq::SliceRandom,
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_sdk::{
@@ -91,8 +91,21 @@ async fn main() -> Result<()> {
     let recent_blockhash = fetch_recent_blockhash(&rpc_url).await?;
     println!("recent blockhash: {recent_blockhash}");
 
-    let client = LunarLanderQuicClient::connect(&endpoint, &api_key).await?;
-    println!("connected to {}", client.endpoint());
+    // Enable MEV protection via the LUNAR_LANDER_MEV_PROTECT env var.
+    let mev_protect = env::var("LUNAR_LANDER_MEV_PROTECT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let options = ClientOptions {
+        mev_protect,
+        ..ClientOptions::default()
+    };
+
+    let client = LunarLanderQuicClient::connect_with_options(&endpoint, &api_key, options).await?;
+    println!(
+        "connected to {} (mev_protect={})",
+        client.endpoint(),
+        mev_protect
+    );
 
     let instructions = vec![
         ComputeBudgetInstruction::set_compute_unit_limit(20_000),
