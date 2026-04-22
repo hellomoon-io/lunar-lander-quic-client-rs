@@ -90,7 +90,8 @@ use {
         time::Duration,
     },
     thiserror::Error,
-    tokio::time::timeout,
+    tokio::{sync::Mutex, time::timeout},
+    tracing::{info, warn},
 };
 
 /// ALPN identifier used by the Lunar Lander QUIC endpoint.
@@ -121,6 +122,12 @@ pub struct ClientOptions {
     /// `2.999.1.1` and is marked non-critical so older servers that do not
     /// understand it will simply ignore it.
     pub mev_protect: bool,
+    /// When `true` (the default), [`LunarLanderQuicClient::send_transaction`]
+    /// will transparently reconnect once if the current QUIC connection has
+    /// been closed (by the server, an idle timeout, a transport reset, …)
+    /// and retry the send on the fresh connection. Set to `false` to opt out
+    /// and receive the original error from the first attempt.
+    pub auto_reconnect: bool,
 }
 
 impl Default for ClientOptions {
@@ -130,6 +137,7 @@ impl Default for ClientOptions {
             keepalive_interval: Duration::from_secs(25),
             idle_timeout: Duration::from_secs(30),
             mev_protect: false,
+            auto_reconnect: true,
         }
     }
 }
@@ -175,6 +183,11 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 ///
 /// Each instance owns one QUIC connection and reuses it across many transaction
 /// sends. Transactions are written as fire-and-forget unidirectional streams.
+///
+/// By default (see [`ClientOptions::auto_reconnect`]),
+/// [`LunarLanderQuicClient::send_transaction`] will reconnect once if the
+/// current connection has died (server restart, idle timeout, transport
+/// reset, …) and retry the send before returning an error to the caller.
 #[derive(Debug)]
 pub struct LunarLanderQuicClient {
     endpoint_label: String,
@@ -182,7 +195,11 @@ pub struct LunarLanderQuicClient {
     server_name: String,
     options: ClientOptions,
     endpoint: Endpoint,
-    connection: Connection,
+    // Guarded so `send_transaction(&self, …)` can replace the handle when a
+    // reconnect happens. Quinn's `Connection` is a cheap Arc-handle, so we
+    // clone it out from under the lock before doing I/O — concurrent sends
+    // don't serialize on this lock, only the (rare) reconnect path does.
+    connection: Mutex<Connection>,
 }
 
 impl LunarLanderQuicClient {
@@ -233,7 +250,7 @@ impl LunarLanderQuicClient {
             server_name,
             options,
             endpoint,
-            connection,
+            connection: Mutex::new(connection),
         })
     }
 
@@ -254,14 +271,20 @@ impl LunarLanderQuicClient {
     }
 
     /// Tears down the current QUIC connection and establishes a new one.
+    ///
+    /// Takes `&mut self` for backward compatibility. Callers using
+    /// [`Self::send_transaction`] typically don't need this: with
+    /// [`ClientOptions::auto_reconnect`] (the default) sends reconnect
+    /// transparently.
     pub async fn reconnect(&mut self) -> Result<()> {
-        self.connection = connect_inner(
+        let new_connection = connect_inner(
             &self.endpoint,
             self.server_addr,
             &self.server_name,
             self.options.connect_timeout,
         )
         .await?;
+        *self.connection.get_mut() = new_connection;
         Ok(())
     }
 
@@ -269,25 +292,84 @@ impl LunarLanderQuicClient {
     ///
     /// The payload should already be fully prepared by the caller. This method
     /// only opens a stream, writes the bytes, and finishes the stream.
+    ///
+    /// If the current QUIC connection has been closed (server restart, idle
+    /// timeout, transport reset, …) and [`ClientOptions::auto_reconnect`] is
+    /// enabled (the default), this method transparently re-handshakes once
+    /// and retries the send on the fresh connection.
     pub async fn send_transaction(&self, payload: &[u8]) -> Result<()> {
-        let mut stream = self
-            .connection
-            .open_uni()
-            .await
-            .map_err(|error| ClientError::OpenUni(error.to_string()))?;
-        stream.write_all(payload).await?;
-        stream
-            .finish()
-            .map_err(|error| ClientError::Finish(error.to_string()))?;
-        Ok(())
+        let connection = { self.connection.lock().await.clone() };
+        match send_on(&connection, payload).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if !self.options.auto_reconnect {
+                    return Err(error);
+                }
+                let Some(close_reason) = connection.close_reason() else {
+                    // Connection is still alive — this is a per-stream or per-write
+                    // error the caller should see verbatim.
+                    return Err(error);
+                };
+                let new_connection = self.reconnect_if_same(&connection, &close_reason).await?;
+                send_on(&new_connection, payload).await
+            }
+        }
     }
 
     /// Closes the QUIC connection and waits for the endpoint to go idle.
     pub async fn close(self) {
-        self.connection.close(0u32.into(), b"client_closed");
+        self.connection
+            .into_inner()
+            .close(0u32.into(), b"client_closed");
         self.endpoint.close(0u32.into(), b"client_closed");
         let _ = self.endpoint.wait_idle().await;
     }
+
+    /// Reconnects only if the stored connection handle is still the one the
+    /// caller observed as dead. If another concurrent send already replaced
+    /// it, we reuse that fresh handle instead of creating yet another
+    /// connection.
+    async fn reconnect_if_same(
+        &self,
+        dead: &Connection,
+        close_reason: &ConnectionError,
+    ) -> Result<Connection> {
+        let mut guard = self.connection.lock().await;
+        if guard.stable_id() == dead.stable_id() {
+            warn!(
+                server = %self.endpoint_label,
+                close_reason = %close_reason,
+                "lunar-lander QUIC connection closed; reconnecting before retry"
+            );
+            let fresh = connect_inner(
+                &self.endpoint,
+                self.server_addr,
+                &self.server_name,
+                self.options.connect_timeout,
+            )
+            .await?;
+            info!(
+                server = %self.endpoint_label,
+                "lunar-lander QUIC connection re-established"
+            );
+            *guard = fresh.clone();
+            Ok(fresh)
+        } else {
+            Ok(guard.clone())
+        }
+    }
+}
+
+async fn send_on(connection: &Connection, payload: &[u8]) -> Result<()> {
+    let mut stream = connection
+        .open_uni()
+        .await
+        .map_err(|error| ClientError::OpenUni(error.to_string()))?;
+    stream.write_all(payload).await?;
+    stream
+        .finish()
+        .map_err(|error| ClientError::Finish(error.to_string()))?;
+    Ok(())
 }
 
 fn install_rustls_provider() {
@@ -463,6 +545,12 @@ mod tests {
     fn default_options_have_mev_protect_disabled() {
         let options = ClientOptions::default();
         assert!(!options.mev_protect);
+    }
+
+    #[test]
+    fn default_options_enable_auto_reconnect() {
+        let options = ClientOptions::default();
+        assert!(options.auto_reconnect);
     }
 
     #[test]

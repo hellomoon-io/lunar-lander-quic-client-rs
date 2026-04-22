@@ -108,6 +108,18 @@ The richer example:
 - randomly selects one destination on each run
 - sends minimum tip threshold of `1_000_000` lamports
 
+## Reconnect behavior
+
+`send_transaction` transparently reconnects if the underlying QUIC
+connection has been closed (server restart, idle timeout, transport
+reset, …) and retries the send once on the fresh connection. This is
+the default, so callers do **not** need their own retry loop for
+connection-level failures.
+
+Opt out by setting `auto_reconnect: false` in `ClientOptions` — the
+first error is then returned to the caller and it is their
+responsibility to call `reconnect()` explicitly.
+
 ## Notes
 
 - Lunar Lander QUIC is tip-enforced.
