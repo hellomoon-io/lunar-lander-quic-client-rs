@@ -110,15 +110,30 @@ The richer example:
 
 ## Reconnect behavior
 
-`send_transaction` transparently reconnects if the underlying QUIC
-connection has been closed (server restart, idle timeout, transport
-reset, …) and retries the send once on the fresh connection. This is
-the default, so callers do **not** need their own retry loop for
-connection-level failures.
+The client keeps the QUIC connection hot in two complementary layers:
 
-Opt out by setting `auto_reconnect: false` in `ClientOptions` — the
-first error is then returned to the caller and it is their
-responsibility to call `reconnect()` explicitly.
+- **`proactive_reconnect`** (default `true`): a background watchdog
+  awaits `Connection::closed()` and re-handshakes as soon as the server
+  closes (graceful shutdown, idle timeout, transport reset, …). The
+  next `send_transaction` lands on the fresh connection without seeing
+  a transient failure first. The watchdog uses a jittered exponential
+  backoff bounded by `reconnect_max_backoff` so a fleet of clients
+  doesn't herd the server on the way back up after a restart.
+- **`auto_reconnect`** (default `true`): if a `send_transaction`
+  observes a closed connection before the watchdog has finished
+  reconnecting, the send transparently reconnects and retries once on
+  the fresh connection. This closes the sub-second race window between
+  close detection and the watchdog's reconnect.
+
+Each flag is independent — disable `auto_reconnect` to opt out of
+at-least-once resend semantics while keeping the connection hot, or
+disable `proactive_reconnect` to keep the client passive and only
+reconnect on demand.
+
+Operators can poll `client.health() -> ConnectionHealth` for the
+current state (`Healthy` / `Reconnecting` / `Disconnected`) and
+`client.reconnects_total()` for cumulative reconnect count without
+parsing tracing output.
 
 ## Notes
 
