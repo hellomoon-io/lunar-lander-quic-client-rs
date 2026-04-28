@@ -30,7 +30,7 @@ This crate is intentionally focused on a small surface area:
 
 ```toml
 [dependencies]
-lunar-lander-quic-client = "0.1.0"
+lunar-lander-quic-client = "0.3.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
