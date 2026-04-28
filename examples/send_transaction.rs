@@ -1,7 +1,7 @@
 use {
     anyhow::{Context, Result, bail},
     lunar_lander_quic_client::{ClientOptions, LunarLanderQuicClient},
-    rand::seq::SliceRandom,
+    rand::seq::IndexedRandom,
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_sdk::{
         hash::Hash,
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
     let rpc_url = env::var("RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
     let keypair_path = env::var("KEYPAIR_PATH").context("KEYPAIR_PATH env var is required")?;
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let tip_address = TIP_DESTINATIONS
         .choose(&mut rng)
         .context("tip destination list must not be empty")?;

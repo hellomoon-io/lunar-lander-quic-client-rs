@@ -30,7 +30,7 @@ This crate is intentionally focused on a small surface area:
 
 ```toml
 [dependencies]
-lunar-lander-quic-client = "0.1.0"
+lunar-lander-quic-client = "0.3.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -107,6 +107,33 @@ The richer example:
 - uses the Lunar Lander tip destination list
 - randomly selects one destination on each run
 - sends minimum tip threshold of `1_000_000` lamports
+
+## Reconnect behavior
+
+The client keeps the QUIC connection hot in two complementary layers:
+
+- **`proactive_reconnect`** (default `true`): a background watchdog
+  awaits `Connection::closed()` and re-handshakes as soon as the server
+  closes (graceful shutdown, idle timeout, transport reset, …). The
+  next `send_transaction` lands on the fresh connection without seeing
+  a transient failure first. The watchdog uses a jittered exponential
+  backoff bounded by `reconnect_max_backoff` so a fleet of clients
+  doesn't herd the server on the way back up after a restart.
+- **`auto_reconnect`** (default `true`): if a `send_transaction`
+  observes a closed connection before the watchdog has finished
+  reconnecting, the send transparently reconnects and retries once on
+  the fresh connection. This closes the sub-second race window between
+  close detection and the watchdog's reconnect.
+
+Each flag is independent — disable `auto_reconnect` to opt out of
+at-least-once resend semantics while keeping the connection hot, or
+disable `proactive_reconnect` to keep the client passive and only
+reconnect on demand.
+
+Operators can poll `client.health() -> ConnectionHealth` for the
+current state (`Healthy` / `Reconnecting` / `Disconnected`) and
+`client.reconnects_total()` for cumulative reconnect count without
+parsing tracing output.
 
 ## Notes
 
