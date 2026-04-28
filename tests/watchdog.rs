@@ -18,8 +18,66 @@ use {
         server::danger::{ClientCertVerified, ClientCertVerifier},
     },
     std::{net::SocketAddr, sync::Arc, time::Duration},
-    tokio::sync::mpsc,
+    tokio::{
+        net::UdpSocket,
+        sync::{mpsc, oneshot},
+        task::JoinHandle,
+    },
 };
+
+/// Owns the server endpoint's accept task. Calling [`kill`] aborts the
+/// task; existing tests can ignore the handle.
+struct TestServerHandle {
+    #[allow(dead_code)]
+    accept_task: JoinHandle<()>,
+}
+
+/// Bidirectional UDP relay between a client-facing socket and an
+/// upstream Quinn server. Calling the returned `oneshot::Sender` makes
+/// the relay stop forwarding in both directions, which is the closest
+/// faithful simulation of a silent network drop available without
+/// platform-specific firewall hooks: no application close frame, no
+/// transport close, just the absence of packets that the keepalive +
+/// idle-timeout path is supposed to detect.
+fn start_silent_drop_proxy(upstream: SocketAddr) -> (SocketAddr, oneshot::Sender<()>) {
+    let proxy_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_std.set_nonblocking(true).expect("nonblocking proxy");
+    let proxy_addr = proxy_std.local_addr().expect("proxy local addr");
+    let proxy = Arc::new(UdpSocket::from_std(proxy_std).expect("tokio proxy socket"));
+
+    let upstream_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind upstream side");
+    upstream_std
+        .set_nonblocking(true)
+        .expect("nonblocking upstream");
+    let upstream_socket =
+        Arc::new(UdpSocket::from_std(upstream_std).expect("tokio upstream socket"));
+
+    let (kill_tx, mut kill_rx) = oneshot::channel();
+    let proxy_loop = Arc::clone(&proxy);
+    let upstream_loop = Arc::clone(&upstream_socket);
+    tokio::spawn(async move {
+        let mut last_client: Option<SocketAddr> = None;
+        let mut buf_client = vec![0u8; 65536];
+        let mut buf_server = vec![0u8; 65536];
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut kill_rx => return,
+                Ok((n, src)) = proxy_loop.recv_from(&mut buf_client) => {
+                    last_client = Some(src);
+                    let _ = upstream_loop.send_to(&buf_client[..n], upstream).await;
+                }
+                Ok((n, _)) = upstream_loop.recv_from(&mut buf_server) => {
+                    if let Some(addr) = last_client {
+                        let _ = proxy_loop.send_to(&buf_server[..n], addr).await;
+                    }
+                }
+            }
+        }
+    });
+
+    (proxy_addr, kill_tx)
+}
 
 fn install_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
@@ -89,8 +147,14 @@ impl ClientCertVerifier for AcceptAnyClientCert {
 /// Bring up a Quinn server bound to 127.0.0.1:0 that speaks the
 /// lunar-lander-tpu ALPN and surfaces each accepted connection through
 /// `conn_tx`. The test can then close individual server-side connections
-/// to exercise the client's close-detection paths.
-fn start_test_server() -> (SocketAddr, mpsc::UnboundedReceiver<Connection>) {
+/// to exercise the client's close-detection paths. The returned
+/// [`TestServerHandle`] keeps the accept task alive for the duration
+/// of the test; tests that don't need it can ignore the value.
+fn start_test_server() -> (
+    SocketAddr,
+    mpsc::UnboundedReceiver<Connection>,
+    TestServerHandle,
+) {
     install_crypto_provider();
 
     let key_pair = KeyPair::generate().expect("keypair");
@@ -114,7 +178,7 @@ fn start_test_server() -> (SocketAddr, mpsc::UnboundedReceiver<Connection>) {
     let addr = endpoint.local_addr().expect("local addr");
 
     let (conn_tx, conn_rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
+    let accept_task = tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let conn_tx = conn_tx.clone();
             tokio::spawn(async move {
@@ -128,7 +192,7 @@ fn start_test_server() -> (SocketAddr, mpsc::UnboundedReceiver<Connection>) {
         }
     });
 
-    (addr, conn_rx)
+    (addr, conn_rx, TestServerHandle { accept_task })
 }
 
 async fn wait_for<F>(mut predicate: F, timeout: Duration) -> bool
@@ -149,7 +213,7 @@ where
 
 #[tokio::test]
 async fn watchdog_reconnects_after_server_close() {
-    let (addr, mut conn_rx) = start_test_server();
+    let (addr, mut conn_rx, _server) = start_test_server();
 
     let options = ClientOptions {
         connect_timeout: Duration::from_secs(2),
@@ -211,7 +275,7 @@ async fn watchdog_reconnects_after_server_close() {
 
 #[tokio::test]
 async fn watchdog_disabled_does_not_reconnect() {
-    let (addr, mut conn_rx) = start_test_server();
+    let (addr, mut conn_rx, _server) = start_test_server();
 
     let options = ClientOptions {
         connect_timeout: Duration::from_secs(2),
@@ -251,7 +315,7 @@ async fn watchdog_disabled_does_not_reconnect() {
 
 #[tokio::test]
 async fn manual_reconnect_rearms_watchdog() {
-    let (addr, mut conn_rx) = start_test_server();
+    let (addr, mut conn_rx, _server) = start_test_server();
 
     let options = ClientOptions {
         connect_timeout: Duration::from_secs(2),
@@ -328,6 +392,59 @@ async fn manual_reconnect_rearms_watchdog() {
         second_conn.stable_id(),
         third_conn.stable_id(),
         "watchdog must produce a fresh handshake after manual reconnect"
+    );
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn watchdog_detects_silent_drop_via_idle_timeout() {
+    // The Quinn server lives behind a UDP relay so we can break the
+    // forwarding path without touching the server's connection state.
+    // The point is to exercise the keepalive + idle_timeout path: the
+    // peer never sends a close frame; the client must detect the dead
+    // connection by absence of keepalive ACKs alone, the way it would
+    // for a silent network drop in production.
+    let (server_addr, mut conn_rx, _server) = start_test_server();
+    let (proxy_addr, proxy_kill) = start_silent_drop_proxy(server_addr);
+
+    // Tight enough that the test runs in well under a second.
+    let options = ClientOptions {
+        connect_timeout: Duration::from_secs(2),
+        keepalive_interval: Duration::from_millis(50),
+        idle_timeout: Duration::from_millis(200),
+        reconnect_initial_backoff: Duration::from_millis(50),
+        reconnect_max_backoff: Duration::from_millis(100),
+        ..ClientOptions::default()
+    };
+    let endpoint_label = format!("127.0.0.1:{}", proxy_addr.port());
+    let client = LunarLanderQuicClient::connect_with_options(
+        &endpoint_label,
+        "silent-drop-test-key",
+        options,
+    )
+    .await
+    .expect("client connects");
+
+    let _first_conn = tokio::time::timeout(Duration::from_secs(2), conn_rx.recv())
+        .await
+        .expect("server accepts initial connection within timeout")
+        .expect("accept loop still alive");
+
+    // Stop the relay. From the client's perspective the peer simply
+    // stops responding. The watchdog must observe the resulting close
+    // through the keepalive path within roughly the configured
+    // idle_timeout window.
+    let _ = proxy_kill.send(());
+
+    let observed = wait_for(
+        || client.health() == ConnectionHealth::Reconnecting,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        observed,
+        "watchdog must observe a silent drop within ~idle_timeout via the keepalive path"
     );
 
     client.close().await;

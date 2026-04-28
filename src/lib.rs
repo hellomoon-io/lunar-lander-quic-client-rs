@@ -116,9 +116,24 @@ pub const MAX_WIRE_TX_BYTES: usize = 1232;
 pub struct ClientOptions {
     /// Maximum time allowed for the initial QUIC connect to complete.
     pub connect_timeout: Duration,
-    /// Keepalive interval used on the QUIC connection.
+    /// Keepalive interval used on the QUIC connection. Must be strictly
+    /// less than [`Self::idle_timeout`]; the constructor returns
+    /// [`ClientError::InvalidTransport`] otherwise. The 2-second default
+    /// is tight enough for the watchdog to detect silent drops within
+    /// ~6 seconds, while leaving room for two missed pings before the
+    /// connection is declared idle.
     pub keepalive_interval: Duration,
     /// Idle timeout advertised to Quinn for this client connection.
+    /// Paired with the 2-second keepalive above, the 6-second default
+    /// holds the 3:1 ratio that tolerates two dropped pings before
+    /// Quinn declares the connection idle and the watchdog reconnects.
+    /// A four-second contiguous-loss budget absorbs routine network
+    /// jitter on cross-region paths and brief client-side scheduler
+    /// stalls without flapping. A 1s/2s configuration would collapse
+    /// the slack to a single missed ping, so a single transient blip
+    /// or Lunar Lander ingress restart would force a reconnect and
+    /// muddy [`LunarLanderQuicClient::reconnects_total`] as a
+    /// real-outage signal.
     pub idle_timeout: Duration,
     /// When `true`, embeds a custom X.509 certificate extension that signals
     /// the server to enable MEV protection for transactions sent over this
@@ -162,8 +177,8 @@ impl Default for ClientOptions {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_secs(25),
-            idle_timeout: Duration::from_secs(30),
+            keepalive_interval: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(6),
             mev_protect: false,
             auto_reconnect: true,
             proactive_reconnect: true,
@@ -202,6 +217,11 @@ const HEALTH_DISCONNECTED: u8 = 2;
 pub enum ClientError {
     #[error("api key must not be empty")]
     EmptyApiKey,
+    #[error(
+        "keepalive_interval ({keepalive:?}) must be strictly less than idle_timeout ({idle:?}); \
+         otherwise the QUIC connection idles out before the next keepalive can refresh it"
+    )]
+    InvalidTransport { keepalive: Duration, idle: Duration },
     #[error("endpoint `{0}` must be host:port")]
     InvalidEndpoint(String),
     #[error("failed to resolve endpoint `{endpoint}`: {source}")]
@@ -641,6 +661,17 @@ fn install_rustls_provider() {
 }
 
 fn build_client_config(api_key: &str, options: &ClientOptions) -> Result<QuinnClientConfig> {
+    // Quinn enforces nothing about the relationship between keepalive and
+    // idle timeout, but if keepalive >= idle then the connection idles out
+    // between pings and the watchdog flaps it. Catch the misconfiguration
+    // at connect time rather than at the first silent drop.
+    if options.keepalive_interval >= options.idle_timeout {
+        return Err(ClientError::InvalidTransport {
+            keepalive: options.keepalive_interval,
+            idle: options.idle_timeout,
+        });
+    }
+
     let key_pair =
         KeyPair::generate().map_err(|error| ClientError::ClientCertificate(error.to_string()))?;
     let mut params = CertificateParams::new(Vec::new())
@@ -855,5 +886,31 @@ mod tests {
         };
         // Should succeed — the custom extension must not break cert generation.
         build_client_config("test-api-key", &options).unwrap();
+    }
+
+    #[test]
+    fn build_client_config_rejects_keepalive_at_or_above_idle() {
+        install_rustls_provider();
+        // Equal: idle expires at exactly the moment keepalive would fire,
+        // which is unsafe.
+        let options = ClientOptions {
+            keepalive_interval: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(5),
+            ..ClientOptions::default()
+        };
+        assert!(matches!(
+            build_client_config("test-api-key", &options),
+            Err(ClientError::InvalidTransport { .. })
+        ));
+        // Greater: connection idles between every ping.
+        let options = ClientOptions {
+            keepalive_interval: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(5),
+            ..ClientOptions::default()
+        };
+        assert!(matches!(
+            build_client_config("test-api-key", &options),
+            Err(ClientError::InvalidTransport { .. })
+        ));
     }
 }
