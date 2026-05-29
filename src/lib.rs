@@ -4,6 +4,8 @@
 //! - connect to a Lunar Lander QUIC endpoint
 //! - generate the client certificate in code from your API key
 //! - send one serialized Solana transaction payload per uni stream
+//! - optionally send one serialized Solana transaction payload per bidi stream
+//!   and read a compact admission response
 //!
 //! It does not perform simulation, preflight, or transaction construction.
 //!
@@ -17,6 +19,8 @@
 //! - opens one QUIC connection and reuses it across many sends
 //! - generates a self-signed client certificate in code from your API key
 //! - writes each transaction payload to its own uni stream
+//! - optionally writes transaction payloads to bidi streams and decodes compact
+//!   response frames
 //!
 //! # What This Crate Does Not Do
 //!
@@ -35,7 +39,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let api_key = std::env::var("LUNAR_LANDER_API_KEY")?;
 //!     let client = LunarLanderQuicClient::connect(
-//!         "fra.lunar-lander.hellomoon.io:16888",
+//!         "lunar-lander.hellomoon.io:16888",
 //!         api_key,
 //!     )
 //!     .await?;
@@ -60,7 +64,7 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let client = LunarLanderQuicClient::connect_with_options(
-//!     "fra.lunar-lander.hellomoon.io:16888",
+//!     "lunar-lander.hellomoon.io:16888",
 //!     std::env::var("LUNAR_LANDER_API_KEY")?,
 //!     ClientOptions {
 //!         mev_protect: true,
@@ -86,6 +90,7 @@ use {
         pki_types::{ServerName, UnixTime},
     },
     std::{
+        fmt,
         net::{SocketAddr, ToSocketAddrs},
         sync::{
             Arc,
@@ -110,6 +115,15 @@ const OID_MEV_PROTECT: &[u64] = &[2, 999, 1, 1];
 pub const DEFAULT_PORT: u16 = 16_888;
 /// Maximum serialized Solana transaction size accepted on the QUIC path.
 pub const MAX_WIRE_TX_BYTES: usize = 1232;
+/// Version byte used by Lunar Lander's compact QUIC submit response frame.
+pub const QUIC_SUBMIT_RESPONSE_VERSION: u8 = 1;
+/// Header length for the compact QUIC submit response frame.
+pub const QUIC_SUBMIT_RESPONSE_HEADER_LEN: usize = 6;
+/// Maximum response body size this client will accept from a bidi submit.
+pub const MAX_QUIC_SUBMIT_RESPONSE_BODY_BYTES: usize = 1024;
+/// Maximum full response frame size this client will read from a bidi submit.
+pub const MAX_QUIC_SUBMIT_RESPONSE_FRAME_BYTES: usize =
+    QUIC_SUBMIT_RESPONSE_HEADER_LEN + MAX_QUIC_SUBMIT_RESPONSE_BODY_BYTES;
 
 /// Connection-level tuning for [`LunarLanderQuicClient`].
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -151,6 +165,10 @@ pub struct ClientOptions {
     /// [`Self::proactive_reconnect`], which controls whether the connection
     /// is kept hot in the background.
     pub auto_reconnect: bool,
+    /// Maximum time allowed for the response-capable bidi submit path to open
+    /// a stream, write the transaction payload, finish the request side, and
+    /// read the compact response frame.
+    pub response_timeout: Duration,
     /// When `true` (the default), the client runs a background watchdog
     /// task that awaits [`Connection::closed`] and re-handshakes
     /// proactively. With this enabled, the next send after a server
@@ -181,11 +199,189 @@ impl Default for ClientOptions {
             idle_timeout: Duration::from_secs(6),
             mev_protect: false,
             auto_reconnect: true,
+            response_timeout: Duration::from_secs(5),
             proactive_reconnect: true,
             reconnect_initial_backoff: Duration::from_millis(250),
             reconnect_max_backoff: Duration::from_secs(30),
         }
     }
+}
+
+/// HTTP-like status category for a compact QUIC submit response.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum QuicSubmitCode {
+    /// Request was accepted by the Lunar Lander send path.
+    Accepted,
+    /// Payload could not be read, decoded, or accepted as a transaction.
+    InvalidPayload,
+    /// Tip enforcement rejected the transaction.
+    TipRequired,
+    /// Global or key rate limiting rejected the request.
+    RateLimited,
+    /// Key policy rejected the transaction.
+    BlockedArbProgram,
+    /// Ingress is shutting down or otherwise unavailable.
+    Unavailable,
+    /// Response status is not known by this client version.
+    UnknownStatus(u16),
+}
+
+impl QuicSubmitCode {
+    fn from_status_and_body(status: u16, body: &str) -> Self {
+        let body = body.to_ascii_lowercase();
+        match status {
+            200 => Self::Accepted,
+            400 if body.contains("tip required") => Self::TipRequired,
+            400 if body.contains("blocked arb program") => Self::BlockedArbProgram,
+            400 => Self::InvalidPayload,
+            403 => Self::BlockedArbProgram,
+            429 => Self::RateLimited,
+            503 => Self::Unavailable,
+            _ => Self::UnknownStatus(status),
+        }
+    }
+}
+
+impl fmt::Display for QuicSubmitCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Accepted => f.write_str("accepted"),
+            Self::InvalidPayload => f.write_str("invalid_payload"),
+            Self::TipRequired => f.write_str("tip_required"),
+            Self::RateLimited => f.write_str("rate_limited"),
+            Self::BlockedArbProgram => f.write_str("blocked_arb_program"),
+            Self::Unavailable => f.write_str("unavailable"),
+            Self::UnknownStatus(status) => write!(f, "unknown_status_{status}"),
+        }
+    }
+}
+
+/// Typed response returned by [`LunarLanderQuicClient::send_transaction_with_response`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct QuicSubmitResponse {
+    /// HTTP-like status from the compact response frame.
+    pub status: u16,
+    /// Client-friendly status category derived from `status` and the response
+    /// body.
+    pub code: QuicSubmitCode,
+    /// Transaction signature returned on successful submissions, when the
+    /// server includes one.
+    pub signature: Option<String>,
+    /// Short stable reason returned on rejected submissions, when the server
+    /// includes one.
+    pub message: Option<String>,
+}
+
+impl QuicSubmitResponse {
+    /// Builds an accepted response, useful for tests and server-side fixtures.
+    pub fn accepted(signature: impl Into<Option<String>>) -> Self {
+        Self {
+            status: 200,
+            code: QuicSubmitCode::Accepted,
+            signature: signature.into(),
+            message: None,
+        }
+    }
+
+    /// Builds an error response, useful for tests and server-side fixtures.
+    pub fn error(status: u16, message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            status,
+            code: QuicSubmitCode::from_status_and_body(status, &message),
+            signature: None,
+            message: Some(message),
+        }
+    }
+
+    /// Decodes the compact Lunar Lander QUIC submit response frame.
+    ///
+    /// Frame layout:
+    ///
+    /// ```text
+    /// version u8 | flags u8 | status u16 BE | body_len u16 BE | body bytes
+    /// ```
+    pub fn decode_frame(frame: &[u8]) -> std::result::Result<Self, QuicSubmitResponseFrameError> {
+        if frame.len() < QUIC_SUBMIT_RESPONSE_HEADER_LEN {
+            return Err(QuicSubmitResponseFrameError::TooShort { len: frame.len() });
+        }
+
+        let version = frame[0];
+        if version != QUIC_SUBMIT_RESPONSE_VERSION {
+            return Err(QuicSubmitResponseFrameError::UnsupportedVersion { version });
+        }
+
+        let flags = frame[1];
+        if flags != 0 {
+            return Err(QuicSubmitResponseFrameError::UnsupportedFlags { flags });
+        }
+
+        let status = u16::from_be_bytes([frame[2], frame[3]]);
+        let body_len = u16::from_be_bytes([frame[4], frame[5]]) as usize;
+        if body_len > MAX_QUIC_SUBMIT_RESPONSE_BODY_BYTES {
+            return Err(QuicSubmitResponseFrameError::BodyTooLong {
+                body_len,
+                max: MAX_QUIC_SUBMIT_RESPONSE_BODY_BYTES,
+            });
+        }
+
+        let actual_body_len = frame.len() - QUIC_SUBMIT_RESPONSE_HEADER_LEN;
+        if body_len != actual_body_len {
+            return Err(QuicSubmitResponseFrameError::BodyLengthMismatch {
+                declared: body_len,
+                actual: actual_body_len,
+            });
+        }
+
+        let body = std::str::from_utf8(&frame[QUIC_SUBMIT_RESPONSE_HEADER_LEN..])?.to_owned();
+        let code = QuicSubmitCode::from_status_and_body(status, &body);
+        let (signature, message) = if status == 200 {
+            (non_empty_string(body), None)
+        } else {
+            (None, non_empty_string(body))
+        };
+
+        Ok(Self {
+            status,
+            code,
+            signature,
+            message,
+        })
+    }
+
+    /// Encodes this response as the compact Lunar Lander QUIC submit response
+    /// frame.
+    pub fn encode_frame(&self) -> std::result::Result<Vec<u8>, QuicSubmitResponseFrameError> {
+        let body = if self.status == 200 {
+            self.signature.as_deref().unwrap_or("")
+        } else {
+            self.message.as_deref().unwrap_or("")
+        };
+        encode_submit_response_frame(self.status, body.as_bytes())
+    }
+
+    /// Returns `true` when the response status is exactly `200`.
+    pub fn is_accepted(&self) -> bool {
+        self.status == 200
+    }
+}
+
+/// Errors returned while decoding or encoding compact QUIC submit response
+/// frames.
+#[derive(Debug, Error)]
+pub enum QuicSubmitResponseFrameError {
+    #[error("frame is too short: {len} bytes")]
+    TooShort { len: usize },
+    #[error("unsupported response frame version {version}")]
+    UnsupportedVersion { version: u8 },
+    #[error("unsupported response frame flags 0x{flags:02x}")]
+    UnsupportedFlags { flags: u8 },
+    #[error("response body length {body_len} exceeds maximum {max}")]
+    BodyTooLong { body_len: usize, max: usize },
+    #[error("declared response body length {declared} does not match actual {actual}")]
+    BodyLengthMismatch { declared: usize, actual: usize },
+    #[error("response body is not valid UTF-8: {0}")]
+    BodyUtf8(#[from] std::str::Utf8Error),
 }
 
 /// Reported reconnect state for a [`LunarLanderQuicClient`].
@@ -246,10 +442,26 @@ pub enum ClientError {
     Connect(String),
     #[error("failed to open uni stream: {0}")]
     OpenUni(String),
+    #[error("failed to open bidi stream: {0}")]
+    OpenBi(String),
     #[error("failed to write transaction payload: {0}")]
     Write(#[from] WriteError),
     #[error("failed to finish uni stream: {0}")]
     Finish(String),
+    #[error("failed to finish bidi request stream: {0}")]
+    FinishBi(String),
+    #[error("timed out waiting for QUIC submit response after {0:?}")]
+    ResponseTimeout(Duration),
+    #[error("failed to read QUIC submit response: {0}")]
+    ReadResponse(String),
+    #[error("invalid QUIC submit response frame: {0}")]
+    InvalidResponseFrame(#[from] QuicSubmitResponseFrameError),
+}
+
+impl ClientError {
+    fn retry_safe_for_bidi_response(&self) -> bool {
+        matches!(self, Self::OpenBi(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;
@@ -302,7 +514,7 @@ impl LunarLanderQuicClient {
     /// Connects to a Lunar Lander QUIC endpoint with default client options.
     ///
     /// `endpoint` must be `host:port`, for example
-    /// `fra.lunar-lander.hellomoon.io:16888`.
+    /// `lunar-lander.hellomoon.io:16888`.
     pub async fn connect(endpoint: impl Into<String>, api_key: impl Into<String>) -> Result<Self> {
         Self::connect_with_options(endpoint, api_key, ClientOptions::default()).await
     }
@@ -484,6 +696,48 @@ impl LunarLanderQuicClient {
         }
     }
 
+    /// Sends one serialized transaction payload over a QUIC bidi stream and
+    /// waits for the compact submit response frame.
+    ///
+    /// The request side is written immediately and finished before the client
+    /// waits for the response, avoiding the QUIC bidi deadlock where a peer
+    /// waits to read before it has sent stream data. This method is separate
+    /// from [`Self::send_transaction`], which remains the uni-stream
+    /// fire-and-forget path.
+    ///
+    /// If the current QUIC connection has been closed before a bidi stream can
+    /// be opened and [`ClientOptions::auto_reconnect`] is enabled, this method
+    /// reconnects once and retries. It does not retry after request bytes may
+    /// have been written, because that could duplicate a submission.
+    pub async fn send_transaction_with_response(
+        &self,
+        payload: &[u8],
+    ) -> Result<QuicSubmitResponse> {
+        let connection = { self.inner.connection.lock().await.clone() };
+        match send_with_response_on(&connection, payload, self.inner.options.response_timeout).await
+        {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                if !self.inner.options.auto_reconnect || !error.retry_safe_for_bidi_response() {
+                    return Err(error);
+                }
+                let Some(close_reason) = connection.close_reason() else {
+                    return Err(error);
+                };
+                let new_connection = self
+                    .inner
+                    .reconnect_if_same(&connection, &close_reason)
+                    .await?;
+                send_with_response_on(
+                    &new_connection,
+                    payload,
+                    self.inner.options.response_timeout,
+                )
+                .await
+            }
+        }
+    }
+
     /// Closes the QUIC connection and waits for the endpoint to go idle.
     pub async fn close(mut self) {
         if let Some(watchdog) = self.watchdog.take() {
@@ -650,6 +904,63 @@ async fn send_on(connection: &Connection, payload: &[u8]) -> Result<()> {
         .finish()
         .map_err(|error| ClientError::Finish(error.to_string()))?;
     Ok(())
+}
+
+async fn send_with_response_on(
+    connection: &Connection,
+    payload: &[u8],
+    response_timeout: Duration,
+) -> Result<QuicSubmitResponse> {
+    timeout(
+        response_timeout,
+        send_with_response_on_inner(connection, payload),
+    )
+    .await
+    .map_err(|_| ClientError::ResponseTimeout(response_timeout))?
+}
+
+async fn send_with_response_on_inner(
+    connection: &Connection,
+    payload: &[u8],
+) -> Result<QuicSubmitResponse> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| ClientError::OpenBi(error.to_string()))?;
+    send.write_all(payload).await?;
+    send.finish()
+        .map_err(|error| ClientError::FinishBi(error.to_string()))?;
+
+    let frame = recv
+        .read_to_end(MAX_QUIC_SUBMIT_RESPONSE_FRAME_BYTES)
+        .await
+        .map_err(|error| ClientError::ReadResponse(error.to_string()))?;
+    Ok(QuicSubmitResponse::decode_frame(&frame)?)
+}
+
+fn encode_submit_response_frame(
+    status: u16,
+    body: &[u8],
+) -> std::result::Result<Vec<u8>, QuicSubmitResponseFrameError> {
+    if body.len() > MAX_QUIC_SUBMIT_RESPONSE_BODY_BYTES {
+        return Err(QuicSubmitResponseFrameError::BodyTooLong {
+            body_len: body.len(),
+            max: MAX_QUIC_SUBMIT_RESPONSE_BODY_BYTES,
+        });
+    }
+
+    let body_len = u16::try_from(body.len()).expect("max response body size fits in u16");
+    let mut frame = Vec::with_capacity(QUIC_SUBMIT_RESPONSE_HEADER_LEN + body.len());
+    frame.push(QUIC_SUBMIT_RESPONSE_VERSION);
+    frame.push(0);
+    frame.extend_from_slice(&status.to_be_bytes());
+    frame.extend_from_slice(&body_len.to_be_bytes());
+    frame.extend_from_slice(body);
+    Ok(frame)
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn install_rustls_provider() {
@@ -820,10 +1131,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_host_from_ipv4_endpoint() {
+    fn parses_host_from_domain_endpoint() {
         assert_eq!(
-            host_from_endpoint("fra.lunar-lander.hellomoon.io:16888").unwrap(),
-            "fra.lunar-lander.hellomoon.io"
+            host_from_endpoint("lunar-lander.hellomoon.io:16888").unwrap(),
+            "lunar-lander.hellomoon.io"
         );
     }
 
@@ -842,6 +1153,12 @@ mod tests {
     fn default_options_enable_auto_reconnect() {
         let options = ClientOptions::default();
         assert!(options.auto_reconnect);
+    }
+
+    #[test]
+    fn default_options_set_response_timeout() {
+        let options = ClientOptions::default();
+        assert_eq!(options.response_timeout, Duration::from_secs(5));
     }
 
     #[test]
@@ -867,6 +1184,159 @@ mod tests {
         for _ in 0..32 {
             assert!(jittered(base) < base);
         }
+    }
+
+    #[test]
+    fn bidi_response_retry_is_only_safe_before_stream_open() {
+        assert!(ClientError::OpenBi("closed".to_string()).retry_safe_for_bidi_response());
+        assert!(!ClientError::FinishBi("closed".to_string()).retry_safe_for_bidi_response());
+        assert!(
+            !ClientError::ResponseTimeout(Duration::from_millis(1)).retry_safe_for_bidi_response()
+        );
+        assert!(!ClientError::ReadResponse("reset".to_string()).retry_safe_for_bidi_response());
+    }
+
+    #[test]
+    fn decodes_accepted_response_frame_with_signature() {
+        let frame = [
+            QUIC_SUBMIT_RESPONSE_VERSION,
+            0,
+            0,
+            200,
+            0,
+            9,
+            b's',
+            b'i',
+            b'g',
+            b'n',
+            b'a',
+            b't',
+            b'u',
+            b'r',
+            b'e',
+        ];
+
+        let response = QuicSubmitResponse::decode_frame(&frame).unwrap();
+
+        assert!(response.is_accepted());
+        assert_eq!(response.status, 200);
+        assert_eq!(response.code, QuicSubmitCode::Accepted);
+        assert_eq!(response.signature.as_deref(), Some("signature"));
+        assert_eq!(response.message, None);
+    }
+
+    #[test]
+    fn decodes_error_response_frame_with_message() {
+        let frame = encode_submit_response_frame(429, b"rate limit exceeded").unwrap();
+
+        let response = QuicSubmitResponse::decode_frame(&frame).unwrap();
+
+        assert!(!response.is_accepted());
+        assert_eq!(response.status, 429);
+        assert_eq!(response.code, QuicSubmitCode::RateLimited);
+        assert_eq!(response.signature, None);
+        assert_eq!(response.message.as_deref(), Some("rate limit exceeded"));
+    }
+
+    #[test]
+    fn classifies_tip_required_from_status_and_body() {
+        let frame = encode_submit_response_frame(400, b"tip required").unwrap();
+
+        let response = QuicSubmitResponse::decode_frame(&frame).unwrap();
+
+        assert_eq!(response.code, QuicSubmitCode::TipRequired);
+        assert_eq!(response.message.as_deref(), Some("tip required"));
+    }
+
+    #[test]
+    fn classifies_blocked_arb_program_from_http_parity_body() {
+        let frame =
+            encode_submit_response_frame(400, b"transaction contains blocked arb program").unwrap();
+
+        let response = QuicSubmitResponse::decode_frame(&frame).unwrap();
+
+        assert_eq!(response.status, 400);
+        assert_eq!(response.code, QuicSubmitCode::BlockedArbProgram);
+        assert_eq!(
+            response.message.as_deref(),
+            Some("transaction contains blocked arb program")
+        );
+    }
+
+    #[test]
+    fn encodes_response_frame_big_endian_header() {
+        let response = QuicSubmitResponse::accepted("abc".to_string());
+
+        let frame = response.encode_frame().unwrap();
+
+        assert_eq!(
+            &frame[..QUIC_SUBMIT_RESPONSE_HEADER_LEN],
+            &[QUIC_SUBMIT_RESPONSE_VERSION, 0, 0, 200, 0, 3]
+        );
+        assert_eq!(&frame[QUIC_SUBMIT_RESPONSE_HEADER_LEN..], b"abc");
+    }
+
+    #[test]
+    fn round_trips_error_response_frame() {
+        let response = QuicSubmitResponse::error(503, "unavailable");
+
+        let decoded = QuicSubmitResponse::decode_frame(&response.encode_frame().unwrap()).unwrap();
+
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn rejects_response_frame_with_wrong_version() {
+        let frame = [2, 0, 0, 200, 0, 0];
+
+        let error = QuicSubmitResponse::decode_frame(&frame).unwrap_err();
+
+        assert!(matches!(
+            error,
+            QuicSubmitResponseFrameError::UnsupportedVersion { version: 2 }
+        ));
+    }
+
+    #[test]
+    fn rejects_response_frame_with_nonzero_flags() {
+        let frame = [QUIC_SUBMIT_RESPONSE_VERSION, 1, 0, 200, 0, 0];
+
+        let error = QuicSubmitResponse::decode_frame(&frame).unwrap_err();
+
+        assert!(matches!(
+            error,
+            QuicSubmitResponseFrameError::UnsupportedFlags { flags: 1 }
+        ));
+    }
+
+    #[test]
+    fn rejects_response_frame_body_length_mismatch() {
+        let frame = [QUIC_SUBMIT_RESPONSE_VERSION, 0, 0, 200, 0, 2, b'a'];
+
+        let error = QuicSubmitResponse::decode_frame(&frame).unwrap_err();
+
+        assert!(matches!(
+            error,
+            QuicSubmitResponseFrameError::BodyLengthMismatch {
+                declared: 2,
+                actual: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_response_frame_body_over_client_limit() {
+        let oversized_body = vec![b'x'; MAX_QUIC_SUBMIT_RESPONSE_BODY_BYTES + 1];
+
+        let error = encode_submit_response_frame(200, &oversized_body).unwrap_err();
+
+        assert!(matches!(
+            error,
+            QuicSubmitResponseFrameError::BodyTooLong {
+                body_len,
+                max: MAX_QUIC_SUBMIT_RESPONSE_BODY_BYTES
+            } if body_len == MAX_QUIC_SUBMIT_RESPONSE_BODY_BYTES + 1
+        ));
     }
 
     #[test]
