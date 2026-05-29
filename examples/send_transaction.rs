@@ -1,5 +1,6 @@
 use {
     anyhow::{Context, Result, bail},
+    common::{DEFAULT_QUIC_ENDPOINT, LUNAR_LANDER_QUIC_ENDPOINT_ENV},
     lunar_lander_quic_client::{ClientOptions, LunarLanderQuicClient},
     rand::seq::IndexedRandom,
     solana_compute_budget_interface::ComputeBudgetInstruction,
@@ -15,7 +16,8 @@ use {
     std::{env, str::FromStr},
 };
 
-const DEFAULT_ENDPOINT: &str = "fra.lunar-lander.hellomoon.io:16888";
+mod common;
+
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const TIP_THRESHOLD_LAMPORTS: u64 = 1_000_000;
 const TIP_DESTINATIONS: &[&str] = &[
@@ -69,8 +71,8 @@ async fn fetch_recent_blockhash(rpc_url: &str) -> Result<Hash> {
 async fn main() -> Result<()> {
     let api_key =
         env::var("LUNAR_LANDER_API_KEY").context("LUNAR_LANDER_API_KEY env var is required")?;
-    let endpoint =
-        env::var("LUNAR_LANDER_QUIC_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
+    let endpoint = env::var(LUNAR_LANDER_QUIC_ENDPOINT_ENV)
+        .unwrap_or_else(|_| DEFAULT_QUIC_ENDPOINT.to_string());
     let rpc_url = env::var("RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
     let keypair_path = env::var("KEYPAIR_PATH").context("KEYPAIR_PATH env var is required")?;
 

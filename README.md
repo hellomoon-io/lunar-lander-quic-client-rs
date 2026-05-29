@@ -12,12 +12,14 @@ This crate is intentionally focused on a small surface area:
 - connect to a Lunar Lander QUIC endpoint
 - authenticate with a client certificate derived from your API key
 - send one serialized Solana transaction per uni stream
+- optionally send one serialized Solana transaction per bidi stream and read a compact admission response
 
 ## What it supports
 
 - Lunar Lander QUIC submission
 - in-code self-signed client certificate generation
 - one connection reused across many sends
+- response-capable bidi submits when you need admission status
 
 ## What it does not do
 
@@ -30,7 +32,7 @@ This crate is intentionally focused on a small surface area:
 
 ```toml
 [dependencies]
-lunar-lander-quic-client = "0.3.0"
+lunar-lander-quic-client = "0.4.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -43,7 +45,7 @@ use lunar_lander_quic_client::LunarLanderQuicClient;
 async fn main() -> anyhow::Result<()> {
     let api_key = std::env::var("LUNAR_LANDER_API_KEY")?;
     let client = LunarLanderQuicClient::connect(
-        "fra.lunar-lander.hellomoon.io:16888",
+        "lunar-lander.hellomoon.io:16888",
         api_key,
     )
     .await?;
@@ -75,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let client = LunarLanderQuicClient::connect_with_options(
-        "fra.lunar-lander.hellomoon.io:16888",
+        "lunar-lander.hellomoon.io:16888",
         api_key,
         options,
     )
@@ -92,12 +94,13 @@ async fn main() -> anyhow::Result<()> {
 
 This repo includes:
 - `send_transaction`: fetch a recent blockhash, build a tipped transaction, sign it, and send it over QUIC
+- `send_transaction_with_response`: send a deliberately malformed payload over a bidi stream and assert the response
 
 Run the richer example with:
 
 ```bash
 LUNAR_LANDER_API_KEY=your-api-key \
-LUNAR_LANDER_QUIC_ENDPOINT=fra.lunar-lander.hellomoon.io:16888 \
+LUNAR_LANDER_QUIC_ENDPOINT=lunar-lander.hellomoon.io:16888 \
 KEYPAIR_PATH=~/.config/solana/id.json \
 RPC_URL=https://api.mainnet-beta.solana.com \
 cargo run --example send_transaction
@@ -107,6 +110,14 @@ The richer example:
 - uses the Lunar Lander tip destination list
 - randomly selects one destination on each run
 - sends minimum tip threshold of `1_000_000` lamports
+
+Run the response-capable smoke example with:
+
+```bash
+LUNAR_LANDER_API_KEY=your-api-key \
+LUNAR_LANDER_QUIC_ENDPOINT=lunar-lander.hellomoon.io:16888 \
+cargo run --example send_transaction_with_response
+```
 
 ## Reconnect behavior
 
@@ -135,9 +146,46 @@ current state (`Healthy` / `Reconnecting` / `Disconnected`) and
 `client.reconnects_total()` for cumulative reconnect count without
 parsing tracing output.
 
+## Response-capable submits
+
+`send_transaction` remains the unidirectional fire-and-forget path. Use
+`send_transaction_with_response` when you need a compact admission response from
+a bidi stream:
+
+```rust
+use lunar_lander_quic_client::{LunarLanderQuicClient, QuicSubmitCode};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let api_key = std::env::var("LUNAR_LANDER_API_KEY")?;
+    let client = LunarLanderQuicClient::connect(
+        "lunar-lander.hellomoon.io:16888",
+        api_key,
+    )
+    .await?;
+
+    let tx_bytes = create_signed_transaction_somewhere()?;
+    let response = client.send_transaction_with_response(&tx_bytes).await?;
+
+    match response.code {
+        QuicSubmitCode::Accepted => println!("accepted"),
+        QuicSubmitCode::InvalidPayload => println!("invalid payload: {:?}", response.message),
+        QuicSubmitCode::TipRequired => println!("tip required: {:?}", response.message),
+        QuicSubmitCode::RateLimited => println!("rate limited: {:?}", response.message),
+        QuicSubmitCode::BlockedArbProgram => {
+            println!("blocked arb program: {:?}", response.message)
+        }
+        QuicSubmitCode::Unavailable => println!("unavailable: {:?}", response.message),
+        QuicSubmitCode::UnknownStatus(_) => println!("server returned {}", response.status),
+    }
+
+    Ok(())
+}
+```
+
 ## Notes
 
 - Lunar Lander QUIC is tip-enforced.
 - The client sends raw transaction bytes only.
 - The client generates the client certificate in code from your API key.
-- Lunar Lander QUIC is fire-and-forget and does not return a per-stream response body.
+- `send_transaction` is fire-and-forget; `send_transaction_with_response` uses a bidi stream.
