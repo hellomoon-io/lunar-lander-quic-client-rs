@@ -113,8 +113,13 @@ pub const LUNAR_LANDER_TPU_PROTOCOL_ID: &[u8] = b"lunar-lander-tpu";
 const OID_MEV_PROTECT: &[u64] = &[2, 999, 1, 1];
 /// Default UDP port for Lunar Lander QUIC ingress.
 pub const DEFAULT_PORT: u16 = 16_888;
-/// Maximum serialized Solana transaction size accepted on the QUIC path.
-pub const MAX_WIRE_TX_BYTES: usize = 1232;
+/// Maximum serialized legacy or v0 transaction size.
+pub const MAX_LEGACY_V0_WIRE_TX_BYTES: usize = 1232;
+/// Maximum serialized v1 transaction size (SIMD-0385).
+pub const MAX_V1_WIRE_TX_BYTES: usize = 4096;
+/// Largest supported transaction size. Legacy/v0 still have a 1,232-byte limit.
+pub const MAX_WIRE_TX_BYTES: usize = MAX_V1_WIRE_TX_BYTES;
+const V1_TRANSACTION_PREFIX: u8 = 0x81;
 /// Version byte used by Lunar Lander's compact QUIC submit response frame.
 pub const QUIC_SUBMIT_RESPONSE_VERSION: u8 = 1;
 /// Header length for the compact QUIC submit response frame.
@@ -411,6 +416,8 @@ const HEALTH_DISCONNECTED: u8 = 2;
 /// Error type returned by the client library.
 #[derive(Debug, Error)]
 pub enum ClientError {
+    #[error("transaction payload is {len} bytes; maximum for this wire version is {max}")]
+    PayloadTooLarge { len: usize, max: usize },
     #[error("api key must not be empty")]
     EmptyApiKey,
     #[error(
@@ -667,6 +674,7 @@ impl LunarLanderQuicClient {
     /// the race window where a send arrives before the background watchdog
     /// has finished replacing the dead connection handle.
     pub async fn send_transaction(&self, payload: &[u8]) -> Result<()> {
+        validate_payload_size(payload)?;
         let connection = { self.inner.connection.lock().await.clone() };
         match send_on(&connection, payload).await {
             Ok(()) => Ok(()),
@@ -713,6 +721,7 @@ impl LunarLanderQuicClient {
         &self,
         payload: &[u8],
     ) -> Result<QuicSubmitResponse> {
+        validate_payload_size(payload)?;
         let connection = { self.inner.connection.lock().await.clone() };
         match send_with_response_on(&connection, payload, self.inner.options.response_timeout).await
         {
@@ -892,6 +901,23 @@ async fn watchdog_loop(inner: Arc<ClientInner>) {
             }
         }
     }
+}
+
+fn validate_payload_size(payload: &[u8]) -> Result<()> {
+    // V1's discriminator is at byte zero. Legacy/v0 start with a compact
+    // signature count. Full decoding and policy validation belong to ingress.
+    let max = if payload.first() == Some(&V1_TRANSACTION_PREFIX) {
+        MAX_V1_WIRE_TX_BYTES
+    } else {
+        MAX_LEGACY_V0_WIRE_TX_BYTES
+    };
+    if payload.len() > max {
+        return Err(ClientError::PayloadTooLarge {
+            len: payload.len(),
+            max,
+        });
+    }
+    Ok(())
 }
 
 async fn send_on(connection: &Connection, payload: &[u8]) -> Result<()> {
@@ -1129,6 +1155,9 @@ fn host_from_endpoint(endpoint: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[path = "transport.rs"]
+    mod transport;
 
     #[test]
     fn parses_host_from_domain_endpoint() {
