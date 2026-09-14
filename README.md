@@ -32,7 +32,7 @@ This crate is intentionally focused on a small surface area:
 
 ```toml
 [dependencies]
-lunar-lander-quic-client = "0.4.0"
+lunar-lander-quic-client = "0.5.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -184,6 +184,37 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 ## Notes
+
+### Transaction versions and stream framing
+
+Both submit methods accept serialized legacy/v0 transactions up to **1,232 bytes**
+and v1 transactions up to **4,096 bytes**. V1 is identified by its first byte,
+`0x81`. Oversized payloads return `ClientError::PayloadTooLarge` before opening a
+stream. This is a size guard, not transaction decoding, signature verification,
+or a guarantee that a server or cluster has activated v1.
+
+`MAX_WIRE_TX_BYTES` is the largest supported size, not the limit for every
+version. Use `MAX_LEGACY_V0_WIRE_TX_BYTES` and `MAX_V1_WIRE_TX_BYTES` when sizing
+version-specific buffers. Transaction construction remains outside this crate;
+the existing examples build legacy transactions.
+
+Keep the entire signed transaction on **one stream**. QUIC segments it into UDP
+datagrams and reassembles the ordered stream; do not split a large transaction
+into multiple streams or add an HTTP batch length prefix. The client finishes
+the request stream after writing all bytes. A successful uni submit only means
+the local write completed; it does not confirm server admission or landing.
+A successful bidi response confirms admission, not execution or confirmation.
+
+For concurrent submissions, share one client (for example through `Arc`) and
+call either submit method per transaction. These independent streams have no
+cross-transaction ordering or atomicity guarantee. They are **not bundles**.
+Ordered bundle submission and length-prefixed HTTP batches use separate HTTP
+APIs and are not implemented by this QUIC-only client.
+
+The offline tests exercise concurrent 4 KiB uni/bidi streams through a bounded
+UDP fault injector that drops, reorders and duplicates datagrams, with a
+1,232-byte datagram ceiling. They verify exact bytes, one delivery per stream,
+response framing and rejection of oversized payloads before network submission.
 
 - Lunar Lander QUIC is tip-enforced.
 - The client sends raw transaction bytes only.
